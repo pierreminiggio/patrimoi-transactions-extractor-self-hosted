@@ -250,6 +250,59 @@ if corrected_ending_balance != stated_ending_balance:
     )
     stated_ending_balance = corrected_ending_balance
 
+
+# Defensive fallback: cross-check which column (Débit vs Crédit) an amount
+# actually falls under, using the same horizontal-position logic we asked
+# the model to apply, rather than trusting its judgment on this specific
+# point. CPU inference isn't perfectly deterministic even at temperature=0
+# (thread-order floating-point differences can flip a close token choice),
+# and this is exactly the kind of close call that's vulnerable to that — so
+# we verify it against the raw aligned text instead of hoping the model got
+# it right this time.
+def find_header_column_positions(text):
+    for line in text.split("\n"):
+        debit_match = re.search(r"D[ée]bit", line, re.IGNORECASE)
+        credit_match = re.search(r"Cr[ée]dit", line, re.IGNORECASE)
+        if debit_match and credit_match:
+            return debit_match.start(), credit_match.start()
+    return None, None
+
+
+DEBIT_COL, CREDIT_COL = find_header_column_positions(statement_text)
+statement_lines = statement_text.split("\n")
+_line_search_cursor = 0
+
+
+def locate_amount_column(description: str, amount_str: str):
+    """Find the source line for this transaction (by matching a chunk of
+    its description text) and determine which column the amount actually
+    sits under, based on its character position relative to the Débit/
+    Crédit header positions. Returns 'debit', 'credit', or None if the
+    line/amount can't be confidently located (in which case the model's
+    original answer is left untouched rather than guessed at).
+    """
+    global _line_search_cursor
+    if DEBIT_COL is None or CREDIT_COL is None or not amount_str:
+        return None
+    desc_key = re.sub(r"\s+", "", description)[:12].upper()
+    if not desc_key:
+        return None
+    try:
+        amount_pattern = re.escape(f"{float(amount_str):.2f}").replace(r"\.", "[.,]")
+    except ValueError:
+        return None
+    for i in range(_line_search_cursor, len(statement_lines)):
+        line = statement_lines[i]
+        line_key = re.sub(r"\s+", "", line).upper()
+        if desc_key and desc_key in line_key:
+            m = re.search(amount_pattern, line)
+            _line_search_cursor = i + 1
+            if not m:
+                return None
+            amount_pos = m.start()
+            return "debit" if abs(amount_pos - DEBIT_COL) < abs(amount_pos - CREDIT_COL) else "credit"
+    return None
+
 # --- Step 4: parse rows and compute running balance deterministically ---
 transactions = []
 running_balance = starting_balance
@@ -286,6 +339,27 @@ for line in data_lines:
     except ValueError as e:
         print(f"ERROR: Could not parse debit/credit on line '{line}': {e}")
         raise SystemExit(1)
+
+    # Cross-check the column assignment against the raw text rather than
+    # trusting the model outright (see locate_amount_column above).
+    amount_str = debit_str or credit_str
+    detected_column = locate_amount_column(description, amount_str)
+    if detected_column == "credit" and debit_str and not credit_str:
+        print(
+            f"Corrected debit/credit column for '{description}': model said "
+            f"debit, but its position in the source text lines up with the "
+            f"Crédit column."
+        )
+        debit_str, credit_str = "", debit_str
+        debit, credit = 0.0, debit
+    elif detected_column == "debit" and credit_str and not debit_str:
+        print(
+            f"Corrected debit/credit column for '{description}': model said "
+            f"credit, but its position in the source text lines up with the "
+            f"Débit column."
+        )
+        credit_str, debit_str = "", credit_str
+        credit, debit = 0.0, credit
 
     row_starting_balance = running_balance
     running_balance = running_balance - debit + credit
