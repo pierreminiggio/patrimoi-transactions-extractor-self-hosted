@@ -1,0 +1,68 @@
+name: Extract Patrimoi Bank Transactions (Self-Hosted LLM)
+
+on:
+  workflow_dispatch:
+    inputs:
+      patrimoi_bank_statement:
+        description: "URL to the Patrimoi bank statement PDF"
+        required: true
+        type: string
+
+env:
+  MODEL_REPO: Qwen/Qwen2.5-7B-Instruct-GGUF
+  MODEL_FILE: qwen2.5-7b-instruct-q4_k_m.gguf
+  MODEL_PATH: models/qwen2.5-7b-instruct-q4_k_m.gguf
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install pdfplumber
+          pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+
+      - name: Cache LLM model weights
+        id: cache-model
+        uses: actions/cache@v4
+        with:
+          path: models
+          key: model-${{ env.MODEL_FILE }}
+
+      - name: Download model weights
+        if: steps.cache-model.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p models
+          curl -sSL -f -o "${MODEL_PATH}" \
+            "https://huggingface.co/${MODEL_REPO}/resolve/main/${MODEL_FILE}"
+
+      - name: Download bank statement PDF
+        env:
+          PDF_URL: ${{ inputs.patrimoi_bank_statement }}
+          PATRIMOI_TOKEN: ${{ secrets.PATRIMOI_TOKEN }}
+        run: |
+          curl -sSL -f \
+            -H "Authorization: Bearer ${PATRIMOI_TOKEN}" \
+            -o account.pdf \
+            "${PDF_URL}"
+
+      - name: Extract transactions (local LLM, no external API calls)
+        env:
+          MODEL_PATH: ${{ env.MODEL_PATH }}
+        run: |
+          python scripts/extract_transactions.py account.pdf transactions.json
+
+      - name: Upload transactions artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: transactions
+          path: transactions.json
+          if-no-files-found: error

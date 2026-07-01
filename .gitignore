@@ -1,0 +1,5 @@
+models/*.gguf
+*.pdf
+transactions.json
+__pycache__/
+*.pyc
