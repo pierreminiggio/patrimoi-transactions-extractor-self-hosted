@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import sys
 
 import pdfplumber
@@ -28,9 +29,21 @@ def extract_pdf_text(path: str) -> str:
     pages_text = []
     with pdfplumber.open(path) as pdf:
         for page in pdf.pages:
-            text = page.extract_text() or ""
+            # layout=True preserves the original spatial positions of words
+            # (via whitespace padding), so table columns stay visually
+            # separated instead of being collapsed into one run-on string.
+            # This matters a lot here: without it, "SOLDE DEBITEUR AU
+            # 07.03.2025" becomes "SOLDEDEBITEURAU07.03.2025", and the
+            # debit/credit columns become impossible to tell apart.
+            text = page.extract_text(layout=True) or ""
             pages_text.append(text)
-    return "\n".join(pages_text)
+    full_text = "\n".join(pages_text)
+    # layout=True pads gaps out to the page's full character width, which
+    # can be 80-100+ spaces between columns. Collapse long runs down to a
+    # fixed width that still visually signals "this is a column break"
+    # without burning a huge number of tokens on whitespace.
+    full_text = re.sub(r" {3,}", "   ", full_text)
+    return full_text
 
 
 statement_text = extract_pdf_text(PDF_PATH)
@@ -60,17 +73,27 @@ Rule for inferring the year:
 - If the statement period falls entirely within a single calendar year, use that year for all transactions.
 - If the statement period spans two different calendar years (i.e. it starts in one year and ends in the next), compare each transaction's month to the period's start and end months: transactions whose month is closer to the period's start belong to the start year, and transactions whose month is closer to the period's end belong to the end year. For example, if a period starts in a late month of one year and ends in an early month of the following year, transactions in that late-year month take the start year, and transactions in that early-year month take the end year.
 
-Also locate the statement's overall starting balance (the account balance at the very beginning of the period, before any listed transactions).
+Also locate the statement's overall starting balance (the account balance at the very beginning of the period, before any listed transactions) and its overall ending balance (the account balance at the very end of the period, after all listed transactions).
+
+IMPORTANT: the statement text may contain lines like "SOLDE DEBITEUR AU <date>" or "SOLDE CREDITEUR AU <date>" (or similar "balance as of <date>" wording). These are balance summary lines, NOT transactions — they restate the account balance at a point in time rather than describing money moving in or out. Do not include these lines as transactions in your output. However, the FIRST such line gives you the STARTING_BALANCE value, and the LAST such line (or the statement's explicit closing balance figure) gives you the ENDING_BALANCE value — extract both of these numbers from those lines, you just don't repeat the lines themselves as transaction rows. The rest of the output should contain only genuine transaction rows (payments, transfers, fees, deposits, purchases, etc.).
 
 Return ONLY plain text in this exact format, no markdown, no code fences, no explanation.
 
 IMPORTANT: the source document is a French bank statement and will show amounts with a comma as decimal separator (e.g. "9,60"). You must convert every amount to use a period as the decimal separator instead (e.g. "9.60"), and remove any thousands separators (spaces or periods). Never output a comma inside a number.
 
+IMPORTANT: dates in the source document may appear as DD.MM.YYYY or DD/MM (without a year). You must always convert these to YYYY-MM-DD format using the inferred year — never output a date in its original DD.MM.YYYY form.
+
+IMPORTANT: preserve the normal spacing between words in the description field exactly as a human would write it (e.g. "VIR SCT INST RECU /DE PIERRE MINIGGIO", not "VIRSCTINSTRECU/DEPIERREMINIGGIO"). The source text may have extra or irregular spacing from table formatting — collapse multiple consecutive spaces into one, but always keep at least one space between separate words.
+
 First line must be exactly:
 STARTING_BALANCE: <number>
 where <number> is the statement's overall starting balance as a plain number with a period decimal separator (e.g. 1234.56).
 
-Second line must be this exact header:
+Second line must be exactly:
+ENDING_BALANCE: <number>
+where <number> is the statement's overall ending balance, same format.
+
+Third line must be this exact header:
 operation_date|description|debit|credit
 
 Then one line per transaction, using these rules:
@@ -156,8 +179,22 @@ except (IndexError, ValueError) as e:
     print(f"ERROR: Could not parse starting balance from '{lines[0]}': {e}")
     raise SystemExit(1)
 
-header = lines[1].split("|")
-data_lines = lines[2:]
+if len(lines) < 2 or not lines[1].upper().startswith("ENDING_BALANCE"):
+    print("ERROR: Model output did not include an ENDING_BALANCE line as expected.")
+    print("--- Raw model output ---")
+    print(output_text)
+    raise SystemExit(1)
+
+try:
+    stated_ending_balance = parse_number(lines[1].split(":", 1)[1])
+    if stated_ending_balance is None:
+        raise ValueError("empty value")
+except (IndexError, ValueError) as e:
+    print(f"ERROR: Could not parse ending balance from '{lines[1]}': {e}")
+    raise SystemExit(1)
+
+header = lines[2].split("|")
+data_lines = lines[3:]
 
 # --- Step 4: parse rows and compute running balance deterministically ---
 transactions = []
@@ -166,6 +203,18 @@ running_balance = starting_balance
 for line in data_lines:
     fields = line.split("|")
     row = dict(zip(header, fields))
+
+    description = row.get("description", "").strip()
+
+    # Defensive fallback: even with the prompt instruction, a small model
+    # can occasionally still echo a "SOLDE DEBITEUR/CREDITEUR AU ..." balance
+    # line as if it were a transaction row. Both the starting and ending
+    # balance values were already captured above from the STARTING_BALANCE /
+    # ENDING_BALANCE lines, so it's safe to drop any stray balance line here
+    # without losing that information.
+    if re.match(r"(?i)^SOLDE\s+(DEBITEUR|CREDITEUR)\s+AU\b", description):
+        print(f"Skipping balance-summary line mistakenly included as a transaction: '{description}'")
+        continue
 
     debit_str = row.get("debit", "").strip()
     credit_str = row.get("credit", "").strip()
@@ -182,7 +231,7 @@ for line in data_lines:
     transactions.append(
         {
             "operation_date": row.get("operation_date", "").strip(),
-            "description": row.get("description", "").strip(),
+            "description": description,
             "debit": f"{debit:.2f}" if debit_str else "",
             "credit": f"{credit:.2f}" if credit_str else "",
             "starting_balance": f"{row_starting_balance:.2f}",
@@ -194,4 +243,13 @@ with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
     json.dump(transactions, f, ensure_ascii=False, indent=2)
 
 print(f"Saved {len(transactions)} transactions to {OUTPUT_PATH}")
-print(f"Final computed ending balance: {running_balance:.2f}")
+print(f"Computed ending balance: {running_balance:.2f}")
+print(f"Statement's stated ending balance: {stated_ending_balance:.2f}")
+
+if abs(running_balance - stated_ending_balance) > 0.01:
+    print(
+        "WARNING: computed ending balance does not match the statement's "
+        "stated ending balance. This usually means a transaction was missed, "
+        "misread, or a debit/credit was misclassified — review "
+        f"{OUTPUT_PATH} against the original PDF before trusting it."
+    )
