@@ -64,6 +64,8 @@ Also locate the statement's overall starting balance (the account balance at the
 
 Return ONLY plain text in this exact format, no markdown, no code fences, no explanation.
 
+IMPORTANT: the source document is a French bank statement and will show amounts with a comma as decimal separator (e.g. "9,60"). You must convert every amount to use a period as the decimal separator instead (e.g. "9.60"), and remove any thousands separators (spaces or periods). Never output a comma inside a number.
+
 First line must be exactly:
 STARTING_BALANCE: <number>
 where <number> is the statement's overall starting balance as a plain number with a period decimal separator (e.g. 1234.56).
@@ -123,8 +125,33 @@ if not lines or not lines[0].upper().startswith("STARTING_BALANCE"):
     print(output_text)
     raise SystemExit(1)
 
+def parse_number(raw: str):
+    """Parse a number that may use either '.' or ',' as the decimal
+    separator, and may include thousands separators (spaces, apostrophes,
+    or the other punctuation mark), despite the prompt asking for a plain
+    period-decimal number. Small local models don't always follow that
+    instruction consistently, so we normalize defensively instead of
+    trusting the format.
+    """
+    s = raw.strip().replace("\u00a0", "").replace(" ", "").replace("'", "")
+    if not s:
+        return None
+    if "," in s and "." in s:
+        # Whichever separator appears last is the decimal separator;
+        # the other is a thousands separator and gets dropped.
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    elif "," in s:
+        s = s.replace(",", ".")
+    return float(s)
+
+
 try:
-    starting_balance = float(lines[0].split(":", 1)[1].strip())
+    starting_balance = parse_number(lines[0].split(":", 1)[1])
+    if starting_balance is None:
+        raise ValueError("empty value")
 except (IndexError, ValueError) as e:
     print(f"ERROR: Could not parse starting balance from '{lines[0]}': {e}")
     raise SystemExit(1)
@@ -142,8 +169,12 @@ for line in data_lines:
 
     debit_str = row.get("debit", "").strip()
     credit_str = row.get("credit", "").strip()
-    debit = float(debit_str) if debit_str else 0.0
-    credit = float(credit_str) if credit_str else 0.0
+    try:
+        debit = parse_number(debit_str) or 0.0
+        credit = parse_number(credit_str) or 0.0
+    except ValueError as e:
+        print(f"ERROR: Could not parse debit/credit on line '{line}': {e}")
+        raise SystemExit(1)
 
     row_starting_balance = running_balance
     running_balance = running_balance - debit + credit
@@ -152,8 +183,8 @@ for line in data_lines:
         {
             "operation_date": row.get("operation_date", "").strip(),
             "description": row.get("description", "").strip(),
-            "debit": debit_str,
-            "credit": credit_str,
+            "debit": f"{debit:.2f}" if debit_str else "",
+            "credit": f"{credit:.2f}" if credit_str else "",
             "starting_balance": f"{row_starting_balance:.2f}",
             "ending_balance": f"{running_balance:.2f}",
         }
