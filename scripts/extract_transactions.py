@@ -35,7 +35,15 @@ def extract_pdf_text(path: str) -> str:
             # This matters a lot here: without it, "SOLDE DEBITEUR AU
             # 07.03.2025" becomes "SOLDEDEBITEURAU07.03.2025", and the
             # debit/credit columns become impossible to tell apart.
-            text = page.extract_text(layout=True) or ""
+            #
+            # x_tolerance controls how close two characters need to be
+            # before pdfplumber treats them as part of the same "word" —
+            # this happens *before* layout mode runs, so if the statement's
+            # table uses tight kerning, the default tolerance can merge
+            # genuinely separate words into a single token that no amount
+            # of layout padding can then split apart. Lowering it makes
+            # word-boundary detection stricter.
+            text = page.extract_text(layout=True, x_tolerance=1) or ""
             pages_text.append(text)
     full_text = "\n".join(pages_text)
     # layout=True pads gaps out to the page's full character width, which
@@ -76,6 +84,8 @@ Rule for inferring the year:
 Also locate the statement's overall starting balance (the account balance at the very beginning of the period, before any listed transactions) and its overall ending balance (the account balance at the very end of the period, after all listed transactions).
 
 IMPORTANT: the statement text may contain lines like "SOLDE DEBITEUR AU <date>" or "SOLDE CREDITEUR AU <date>" (or similar "balance as of <date>" wording). These are balance summary lines, NOT transactions — they restate the account balance at a point in time rather than describing money moving in or out. Do not include these lines as transactions in your output. However, the FIRST such line gives you the STARTING_BALANCE value, and the LAST such line (or the statement's explicit closing balance figure) gives you the ENDING_BALANCE value — extract both of these numbers from those lines, you just don't repeat the lines themselves as transaction rows. The rest of the output should contain only genuine transaction rows (payments, transfers, fees, deposits, purchases, etc.).
+
+IMPORTANT — sign convention: "SOLDE DEBITEUR" means the account is overdrawn (the customer owes the bank money), so this figure must be recorded as a NEGATIVE number even though it's printed as a plain positive amount on the statement. For example, "SOLDE DEBITEUR AU 07.03.2025  9,60" means STARTING_BALANCE is -9.60, not 9.60. "SOLDE CREDITEUR" means a normal positive balance, so record that figure as-is (positive). Apply this same sign rule to whichever of STARTING_BALANCE or ENDING_BALANCE comes from a "DEBITEUR" line.
 
 Return ONLY plain text in this exact format, no markdown, no code fences, no explanation.
 
@@ -195,6 +205,43 @@ except (IndexError, ValueError) as e:
 
 header = lines[2].split("|")
 data_lines = lines[3:]
+
+
+# Defensive fallback: cross-check the sign of the starting/ending balance
+# against the actual "SOLDE DEBITEUR/CREDITEUR" wording found in the
+# extracted text, and correct it if the model got the sign convention wrong.
+def enforce_balance_sign(value: float, keyword_match) -> float:
+    if keyword_match is None:
+        return value
+    is_debiteur = keyword_match.group(1).upper() == "DEBITEUR"
+    if is_debiteur and value > 0:
+        return -value
+    if not is_debiteur and value < 0:
+        return -value
+    return value
+
+
+solde_matches = list(re.finditer(r"(?i)SOLDE\s+(DEBITEUR|CREDITEUR)\s+AU\b", statement_text))
+first_solde_match = solde_matches[0] if solde_matches else None
+last_solde_match = solde_matches[-1] if solde_matches else None
+
+corrected_starting_balance = enforce_balance_sign(starting_balance, first_solde_match)
+if corrected_starting_balance != starting_balance:
+    print(
+        f"Corrected starting balance sign: model gave {starting_balance:.2f}, "
+        f"but the source text says '{first_solde_match.group(0)}', so using "
+        f"{corrected_starting_balance:.2f} instead."
+    )
+    starting_balance = corrected_starting_balance
+
+corrected_ending_balance = enforce_balance_sign(stated_ending_balance, last_solde_match)
+if corrected_ending_balance != stated_ending_balance:
+    print(
+        f"Corrected ending balance sign: model gave {stated_ending_balance:.2f}, "
+        f"but the source text says '{last_solde_match.group(0)}', so using "
+        f"{corrected_ending_balance:.2f} instead."
+    )
+    stated_ending_balance = corrected_ending_balance
 
 # --- Step 4: parse rows and compute running balance deterministically ---
 transactions = []
