@@ -115,7 +115,7 @@ operation_date|description|debit|credit
 
 Then one line per transaction, using these rules:
 - operation_date: the date from the left-most "Date" column (do not use any "Valeur"/value-date column, even if present), formatted as YYYY-MM-DD using the inferred year
-- description: full operation text, with any pipe characters removed if present, and internal line breaks replaced with a single space
+- description: the full text of the "Nature des opérations" column only. Do NOT include the "Valeur" column's date in the description — it is a separate column and must be left out entirely, even though it may appear right after the description text on the same line. If a transaction's description wraps onto one or more additional lines below it (these continuation lines have no date at the start and are indented under the description, often containing extra reference details like "/REF ..." or "/MOTIF ..."), append that continuation text to the same transaction's description with a single space, do not create a separate transaction or drop it. Remove any pipe characters if present.
 - debit: the debit amount as a plain number with a period decimal separator (e.g. 3.99), or empty if not a debit
 - credit: the credit amount as a plain number with a period decimal separator, or empty if not a credit
 
@@ -259,6 +259,10 @@ for line in data_lines:
     row = dict(zip(header, fields))
 
     description = row.get("description", "").strip()
+    # Defensive fallback: strip a stray trailing "Valeur" column date
+    # (format DD.MM) if the model still leaks one onto the end of the
+    # description despite the prompt instruction not to include it.
+    description = re.sub(r"\s+\d{2}\.\d{2}$", "", description).strip()
 
     # Defensive fallback: even with the prompt instruction, a small model
     # can occasionally still echo a "SOLDE DEBITEUR/CREDITEUR AU ..." balance
