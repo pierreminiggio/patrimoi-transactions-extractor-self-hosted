@@ -50,8 +50,15 @@ standard GitHub-hosted runners (2 cores, 7 GB RAM).
 
 If you want to trade accuracy for speed (or vice versa), swap the model by
 changing `MODEL_REPO` / `MODEL_FILE` in the workflow, e.g.:
-- Faster / lighter: `Qwen/Qwen2.5-3B-Instruct-GGUF`, `qwen2.5-3b-instruct-q4_k_m.gguf`
-- More accurate, slower: `Qwen/Qwen2.5-14B-Instruct-GGUF`, `qwen2.5-14b-instruct-q4_k_m.gguf`
+- Faster / lighter: `bartowski/Qwen2.5-3B-Instruct-GGUF`, `Qwen2.5-3B-Instruct-Q4_K_M.gguf`
+- More accurate, slower: `bartowski/Qwen2.5-14B-Instruct-GGUF`, `Qwen2.5-14B-Instruct-Q4_K_M.gguf`
+
+Use bartowski's quantizations (rather than the official `Qwen/...-GGUF` repos)
+because the official repos split larger quant files into multiple shards
+(`-00001-of-00002.gguf`, etc.), which a plain single-file `curl` download
+won't handle. bartowski publishes each quant as one file. Before swapping,
+double-check the exact filename on the repo's "Files and versions" tab —
+it's case-sensitive and 404s otherwise.
 
 The model file is cached between runs via `actions/cache`, so only the
 first run pays the download cost.

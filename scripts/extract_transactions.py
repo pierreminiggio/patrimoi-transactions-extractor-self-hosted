@@ -6,7 +6,7 @@ import pdfplumber
 from llama_cpp import Llama
 
 # --- Configuration via environment / args ---
-MODEL_PATH = os.environ.get("MODEL_PATH", "models/qwen2.5-7b-instruct-q4_k_m.gguf")
+MODEL_PATH = os.environ.get("MODEL_PATH", "models/Qwen2.5-7B-Instruct-Q4_K_M.gguf")
 N_CTX = int(os.environ.get("LLM_N_CTX", "32768"))
 
 if not os.path.exists(MODEL_PATH):

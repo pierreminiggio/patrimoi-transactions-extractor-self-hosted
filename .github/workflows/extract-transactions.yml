@@ -9,9 +9,9 @@ on:
         type: string
 
 env:
-  MODEL_REPO: Qwen/Qwen2.5-7B-Instruct-GGUF
-  MODEL_FILE: qwen2.5-7b-instruct-q4_k_m.gguf
-  MODEL_PATH: models/qwen2.5-7b-instruct-q4_k_m.gguf
+  MODEL_REPO: bartowski/Qwen2.5-7B-Instruct-GGUF
+  MODEL_FILE: Qwen2.5-7B-Instruct-Q4_K_M.gguf
+  MODEL_PATH: models/Qwen2.5-7B-Instruct-Q4_K_M.gguf
 
 jobs:
   extract:
@@ -41,8 +41,14 @@ jobs:
         if: steps.cache-model.outputs.cache-hit != 'true'
         run: |
           mkdir -p models
-          curl -sSL -f -o "${MODEL_PATH}" \
-            "https://huggingface.co/${MODEL_REPO}/resolve/main/${MODEL_FILE}"
+          MODEL_URL="https://huggingface.co/${MODEL_REPO}/resolve/main/${MODEL_FILE}"
+          echo "Downloading ${MODEL_URL}"
+          if ! curl -sSL -f -o "${MODEL_PATH}" "${MODEL_URL}"; then
+            echo "ERROR: failed to download model from ${MODEL_URL}"
+            echo "Check that MODEL_REPO/MODEL_FILE point to a real, non-split file at:"
+            echo "https://huggingface.co/${MODEL_REPO}/tree/main"
+            exit 1
+          fi
 
       - name: Download bank statement PDF
         env:
