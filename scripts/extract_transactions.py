@@ -82,12 +82,6 @@ Extract every money transaction from this bank statement text.
 
 CRITICAL — reading the Débit vs Crédit columns: the header row contains column names (e.g. "Date", "Nature des opérations", "Valeur", "Débit", "Crédit") at specific horizontal positions. For every amount in a transaction row, determine whether it is a debit or a credit by comparing its horizontal position (how many characters from the start of the line) to the horizontal position of the "Débit" and "Crédit" words in the header row — an amount is a debit if it lines up under "Débit", and a credit if it lines up under "Crédit". Do not guess based on typical transaction meaning (e.g. do not assume a wording like "RECU"/"received" is automatically a credit) — always verify against the actual column position in the text, since that is the ground truth. A single row will have a value in only one of the two columns, never both.
 
-First, locate the statement period stated at the top of the document (it will appear as a date range, such as a "from X to Y" style heading, often near the title). Use the start and end dates of this period to determine the correct year for every transaction date, since individual transaction dates in the table typically only show day and month, not the year.
-
-Rule for inferring the year:
-- If the statement period falls entirely within a single calendar year, use that year for all transactions.
-- If the statement period spans two different calendar years (i.e. it starts in one year and ends in the next), compare each transaction's month to the period's start and end months: transactions whose month is closer to the period's start belong to the start year, and transactions whose month is closer to the period's end belong to the end year. For example, if a period starts in a late month of one year and ends in an early month of the following year, transactions in that late-year month take the start year, and transactions in that early-year month take the end year.
-
 Also locate the statement's overall starting balance (the account balance at the very beginning of the period, before any listed transactions) and its overall ending balance (the account balance at the very end of the period, after all listed transactions).
 
 IMPORTANT: the statement text may contain lines like "SOLDE DEBITEUR AU <date>" or "SOLDE CREDITEUR AU <date>" (or similar "balance as of <date>" wording), or a "TOTAL DES OPERATIONS" (or "TOTAL DES MOUVEMENTS") row summing all debits and credits for the period. These are all summary lines, NOT transactions — they restate a balance or a total rather than describing a single instance of money moving in or out. Do not include any of these lines as transactions in your output. However, the FIRST "SOLDE..." line gives you the STARTING_BALANCE value, and the LAST "SOLDE..." line (or the statement's explicit closing balance figure) gives you the ENDING_BALANCE value — extract both of these numbers from those lines, you just don't repeat the lines themselves as transaction rows. The rest of the output should contain only genuine transaction rows (payments, transfers, fees, deposits, purchases, etc.).
@@ -97,8 +91,6 @@ IMPORTANT — sign convention: "SOLDE DEBITEUR" means the account is overdrawn (
 Return ONLY plain text in this exact format, no markdown, no code fences, no explanation.
 
 IMPORTANT: the source document is a French bank statement and will show amounts with a comma as decimal separator (e.g. "9,60"). You must convert every amount to use a period as the decimal separator instead (e.g. "9.60"), and remove any thousands separators (spaces or periods). Never output a comma inside a number.
-
-IMPORTANT: dates in the source document may appear as DD.MM.YYYY or DD/MM (without a year). You must always convert these to YYYY-MM-DD format using the inferred year — never output a date in its original DD.MM.YYYY form.
 
 IMPORTANT: preserve the normal spacing between words in the description field exactly as a human would write it (e.g. "VIR SCT INST RECU /DE PIERRE MINIGGIO", not "VIRSCTINSTRECU/DEPIERREMINIGGIO"). The source text may have extra or irregular spacing from table formatting — collapse multiple consecutive spaces into one, but always keep at least one space between separate words.
 
@@ -114,7 +106,7 @@ Third line must be this exact header:
 operation_date|description|debit|credit
 
 Then one line per transaction, using these rules:
-- operation_date: the date from the left-most "Date" column (do not use any "Valeur"/value-date column, even if present), formatted as YYYY-MM-DD using the inferred year
+- operation_date: the date from the left-most "Date" column, copied EXACTLY as printed (e.g. "09.05" or "07.03.2025") — do not try to add, guess, or compute a year yourself, and do not reformat it; a separate deterministic process handles that afterward. Do not use any "Valeur"/value-date column, even if present.
 - description: the full text of the "Nature des opérations" column only. Do NOT include the "Valeur" column's date in the description — it is a separate column and must be left out entirely, even though it may appear right after the description text on the same line. If a transaction's description wraps onto one or more additional lines below it (these continuation lines have no date at the start and are indented under the description, often containing extra reference details like "/REF ..." or "/MOTIF ..."), append that continuation text to the same transaction's description with a single space, do not create a separate transaction or drop it. Remove any pipe characters if present.
 - debit: the debit amount as a plain number with a period decimal separator (e.g. 3.99), or empty if not a debit
 - credit: the credit amount as a plain number with a period decimal separator, or empty if not a credit
@@ -228,7 +220,10 @@ def enforce_balance_sign(value: float, keyword_match) -> float:
     return value
 
 
-solde_matches = list(re.finditer(r"(?i)SOLDE\s+(DEBITEUR|CREDITEUR)\s+AU\b", statement_text))
+solde_pattern = re.compile(
+    r"(?i)SOLDE\s+(DEBITEUR|CREDITEUR)\s+AU\s+(\d{1,2})[./-](\d{1,2})[./-](\d{4})"
+)
+solde_matches = list(solde_pattern.finditer(statement_text))
 first_solde_match = solde_matches[0] if solde_matches else None
 last_solde_match = solde_matches[-1] if solde_matches else None
 
@@ -249,6 +244,100 @@ if corrected_ending_balance != stated_ending_balance:
         f"{corrected_ending_balance:.2f} instead."
     )
     stated_ending_balance = corrected_ending_balance
+
+
+# --- Statement period + year inference (fully deterministic) ---
+# The model was previously asked to figure out each transaction's year
+# itself (since the table only prints day.month), and this turned out to be
+# unreliable across statements — it would often just echo the raw "DD.MM"
+# text untouched. Instead we extract the statement's real start/end dates
+# here in Python (which we already have from the SOLDE lines above, or a
+# French-language date-range header as a fallback) and apply the year
+# inference rule deterministically for every transaction.
+FRENCH_MONTHS = {
+    "janvier": 1, "février": 2, "fevrier": 2, "mars": 3, "avril": 4,
+    "mai": 5, "juin": 6, "juillet": 7, "août": 8, "aout": 8,
+    "septembre": 9, "octobre": 10, "novembre": 11, "décembre": 12, "decembre": 12,
+}
+
+
+def get_period_from_solde_lines():
+    if not first_solde_match or not last_solde_match:
+        return None, None
+    start = (int(first_solde_match.group(4)), int(first_solde_match.group(3)), int(first_solde_match.group(2)))
+    end = (int(last_solde_match.group(4)), int(last_solde_match.group(3)), int(last_solde_match.group(2)))
+    return start, end  # each a (year, month, day) tuple
+
+
+def get_period_from_header_text():
+    # Fallback for statements without SOLDE lines: look for a French
+    # "du <day> <month name> <year> au <day> <month name> <year>" heading.
+    m = re.search(
+        r"(?i)du\s+(\d{1,2})\s+(\w+)\s+(\d{4})\s+au\s+(\d{1,2})\s+(\w+)\s+(\d{4})",
+        statement_text,
+    )
+    if not m:
+        return None, None
+    d1, mo1, y1, d2, mo2, y2 = m.groups()
+    mo1_num = FRENCH_MONTHS.get(mo1.lower())
+    mo2_num = FRENCH_MONTHS.get(mo2.lower())
+    if mo1_num is None or mo2_num is None:
+        return None, None
+    return (int(y1), mo1_num, int(d1)), (int(y2), mo2_num, int(d2))
+
+
+period_start, period_end = get_period_from_solde_lines()
+if period_start is None or period_end is None:
+    period_start, period_end = get_period_from_header_text()
+
+if period_start is None or period_end is None:
+    print(
+        "WARNING: could not determine the statement's date period from the "
+        "text (no SOLDE lines or recognizable date-range header found). "
+        "Transaction dates that only include day.month will be left "
+        "un-converted, which will not match YYYY-MM-DD format."
+    )
+
+
+def infer_year(month: int) -> int | None:
+    if period_start is None or period_end is None:
+        return None
+    start_year, start_month = period_start[0], period_start[1]
+    end_year, end_month = period_end[0], period_end[1]
+    if start_year == end_year:
+        return start_year
+
+    def month_distance(m1, m2):
+        d = abs(m1 - m2)
+        return min(d, 12 - d)
+
+    if month_distance(month, start_month) <= month_distance(month, end_month):
+        return start_year
+    return end_year
+
+
+def normalize_operation_date(raw: str) -> str:
+    raw = raw.strip()
+    # Already in YYYY-MM-DD format — trust it as-is.
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", raw):
+        return raw
+    # DD.MM.YYYY or DD/MM/YYYY — year already present, just reformat.
+    m = re.match(r"^(\d{1,2})[./-](\d{1,2})[./-](\d{4})$", raw)
+    if m:
+        day, month, year = m.groups()
+        return f"{int(year):04d}-{int(month):02d}-{int(day):02d}"
+    # DD.MM or DD/MM — no year, infer it from the statement period.
+    m = re.match(r"^(\d{1,2})[./-](\d{1,2})$", raw)
+    if m:
+        day, month = m.groups()
+        year = infer_year(int(month))
+        if year is None:
+            print(f"WARNING: could not infer a year for date '{raw}'; leaving it un-converted.")
+            return raw
+        return f"{year:04d}-{int(month):02d}-{int(day):02d}"
+    # Unrecognized format — leave as-is rather than guessing.
+    print(f"WARNING: unrecognized date format '{raw}'; leaving it un-converted.")
+    return raw
 
 
 # Defensive fallback: cross-check which column (Débit vs Crédit) an amount
@@ -366,7 +455,7 @@ for line in data_lines:
 
     transactions.append(
         {
-            "operation_date": row.get("operation_date", "").strip(),
+            "operation_date": normalize_operation_date(row.get("operation_date", "").strip()),
             "description": description,
             "debit": f"{debit:.2f}" if debit_str else "",
             "credit": f"{credit:.2f}" if credit_str else "",
