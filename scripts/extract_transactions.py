@@ -32,29 +32,18 @@ def extract_pdf_text(path: str) -> str:
             # layout=True preserves the original spatial positions of words
             # (via whitespace padding), so table columns stay visually
             # separated instead of being collapsed into one run-on string.
-            # This matters a lot here: without it, "SOLDE DEBITEUR AU
-            # 07.03.2025" becomes "SOLDEDEBITEURAU07.03.2025", and the
-            # debit/credit columns become impossible to tell apart.
-            #
             # x_tolerance controls how close two characters need to be
             # before pdfplumber treats them as part of the same "word" —
-            # this happens *before* layout mode runs, so if the statement's
-            # table uses tight kerning, the default tolerance can merge
-            # genuinely separate words into a single token that no amount
-            # of layout padding can then split apart. Lowering it makes
-            # word-boundary detection stricter.
+            # lowering it makes word-boundary detection stricter, which
+            # matters for tightly-kerned table text.
             text = page.extract_text(layout=True, x_tolerance=1) or ""
             pages_text.append(text)
     full_text = "\n".join(pages_text)
-    # NOTE: do not collapse internal whitespace runs here. The horizontal
-    # position of a number (e.g. how far right "15,00" sits relative to the
-    # "Débit"/"Crédit" column headers) is the ONLY signal that tells us
-    # which column it belongs to, since these statements have no other
-    # per-row column markers. Collapsing long space runs down to a fixed
-    # width destroys that signal and makes debit/credit indistinguishable
-    # (this was tried and caused misclassified transactions). Trailing
-    # whitespace per line is harmless to trim since it carries no column
-    # information.
+    # NOTE: do not collapse internal whitespace runs. The horizontal position
+    # of a number relative to column headers is often the only signal for
+    # which column it belongs to (debit vs credit). Collapsing space runs
+    # down to a fixed width destroys that signal. Trailing whitespace per
+    # line is harmless to trim since it carries no column information.
     full_text = "\n".join(line.rstrip() for line in full_text.split("\n"))
     return full_text
 
@@ -70,48 +59,50 @@ if not statement_text.strip():
     raise SystemExit(1)
 
 # --- Step 2: build the prompt ---
-# Note the model is only asked to extract raw fields (date, description,
-# debit, credit) plus the single overall starting balance. The running
-# balance per transaction is computed deterministically in Python below,
-# rather than trusted to the model's arithmetic, which is more reliable on
-# a small local model than asking it to carry a running sum across dozens
-# of rows.
-prompt = f"""You are given the raw text extracted from a bank statement PDF, with the original table layout preserved using spacing — columns are visually aligned using whitespace, the same way they'd look if you printed the PDF as plain text with a monospaced font. This spacing is meaningful and must be read carefully.
+# The model is only asked to extract raw fields (date, description, debit,
+# credit, and — if the document shows one — a per-transaction running
+# balance). Everything requiring arithmetic, date math, sign conventions, or
+# chronological ordering is done deterministically in Python afterward,
+# because small local models have proven unreliable at all of those across
+# a range of real statement formats (French and English, table-based and
+# block-based, chronological and reverse-chronological).
+prompt = f"""You are given the raw text extracted from a bank/financial account statement PDF, with the original layout preserved using spacing — columns are visually aligned using whitespace, the same way they'd look if you printed the PDF as plain text with a monospaced font. This spacing is meaningful and must be read carefully.
 
-Extract every money transaction from this bank statement text.
+Extract every money transaction from this statement text. Statements come from different providers and look different: some are tables with a "Date | Description | Débit | Crédit" style layout (French), others list each transaction as its own block of a few lines with labels like "Incoming"/"Outgoing"/"Amount" (English), and others use different wording still. Apply the general principles below regardless of the exact wording used in this particular document.
 
-CRITICAL — reading the Débit vs Crédit columns: the header row contains column names (e.g. "Date", "Nature des opérations", "Valeur", "Débit", "Crédit") at specific horizontal positions. For every amount in a transaction row, determine whether it is a debit or a credit by comparing its horizontal position (how many characters from the start of the line) to the horizontal position of the "Débit" and "Crédit" words in the header row — an amount is a debit if it lines up under "Débit", and a credit if it lines up under "Crédit". Do not guess based on typical transaction meaning (e.g. do not assume a wording like "RECU"/"received" is automatically a credit) — always verify against the actual column position in the text, since that is the ground truth. A single row will have a value in only one of the two columns, never both.
+CRITICAL — determining debit vs credit for each transaction, in order of preference:
+1. If amounts appear in two separate columns with headers (in any language) roughly meaning "money out" and "money in" — e.g. "Débit"/"Crédit", "Debit"/"Credit", "Outgoing"/"Incoming", "Withdrawal"/"Deposit" — determine which column an amount belongs to by comparing its horizontal position (character offset from the start of the line) to the horizontal position of those header words. Do not guess based on what the transaction sounds like (e.g. do not assume "received"-sounding wording is automatically a credit) — the column position is the ground truth.
+2. If amounts appear with an explicit sign or a single "Outgoing" value that is written as a negative number (e.g. "-23.56"), a negative/outgoing value is a debit and a positive/incoming value is a credit.
+Do not put a value in both debit and credit for the same transaction — exactly one of the two must be filled in, the other left empty.
 
-Also locate the statement's overall starting balance (the account balance at the very beginning of the period, before any listed transactions) and its overall ending balance (the account balance at the very end of the period, after all listed transactions).
+CRITICAL — statement balance: some statements state an explicit overall balance at specific points, e.g. "SOLDE DEBITEUR AU <date>" / "SOLDE CREDITEUR AU <date>" (French) or "balance as of <date>" / "opening balance" / "closing balance" (English) or similar wording in another language. If you find such statements, use the earliest one for STARTING_BALANCE and the latest (or most current) one for ENDING_BALANCE. In French, "DEBITEUR" means the account is overdrawn — record that figure as a NEGATIVE number even though it's printed as a plain positive amount (e.g. "SOLDE DEBITEUR AU 07.03.2025  9,60" means -9.60); "CREDITEUR" is a normal positive balance, record as printed.
+If the document does NOT state an explicit overall starting or ending balance anywhere, but instead shows a running balance next to each individual transaction (e.g. an "Amount" column that is the balance immediately after that transaction), then write UNKNOWN for STARTING_BALANCE and/or ENDING_BALANCE instead of a number, and instead fill in the resulting_balance field (described below) for every transaction — a separate deterministic process will derive the overall starting/ending balance from those per-transaction values.
 
-IMPORTANT: the statement text may contain lines like "SOLDE DEBITEUR AU <date>" or "SOLDE CREDITEUR AU <date>" (or similar "balance as of <date>" wording), or a "TOTAL DES OPERATIONS" (or "TOTAL DES MOUVEMENTS") row summing all debits and credits for the period. These are all summary lines, NOT transactions — they restate a balance or a total rather than describing a single instance of money moving in or out. Do not include any of these lines as transactions in your output. However, the FIRST "SOLDE..." line gives you the STARTING_BALANCE value, and the LAST "SOLDE..." line (or the statement's explicit closing balance figure) gives you the ENDING_BALANCE value — extract both of these numbers from those lines, you just don't repeat the lines themselves as transaction rows. The rest of the output should contain only genuine transaction rows (payments, transfers, fees, deposits, purchases, etc.).
+CRITICAL — some statements list transactions oldest-first, others list them newest-first. You do not need to figure out which, or reorder anything — just transcribe each transaction row once, in whatever order it appears in the source text. A separate deterministic process will sort everything chronologically afterward.
 
-IMPORTANT — sign convention: "SOLDE DEBITEUR" means the account is overdrawn (the customer owes the bank money), so this figure must be recorded as a NEGATIVE number even though it's printed as a plain positive amount on the statement. For example, "SOLDE DEBITEUR AU 07.03.2025  9,60" means STARTING_BALANCE is -9.60, not 9.60. "SOLDE CREDITEUR" means a normal positive balance, so record that figure as-is (positive). Apply this same sign rule to whichever of STARTING_BALANCE or ENDING_BALANCE comes from a "DEBITEUR" line.
+Also: the text may contain summary/total lines (e.g. "SOLDE DEBITEUR/CREDITEUR AU <date>", "TOTAL DES OPERATIONS", "TOTAL DES MOUVEMENTS", or similar wording) that restate a balance or a total rather than describing one specific transaction. Do NOT include these as transaction rows — skip them entirely (their balance values are already captured via STARTING_BALANCE/ENDING_BALANCE above, if present). Only genuine individual transactions (payments, transfers, fees, deposits, purchases, cashback, etc.) belong in the output rows.
 
 Return ONLY plain text in this exact format, no markdown, no code fences, no explanation.
 
-IMPORTANT: the source document is a French bank statement and will show amounts with a comma as decimal separator (e.g. "9,60"). You must convert every amount to use a period as the decimal separator instead (e.g. "9.60"), and remove any thousands separators (spaces or periods). Never output a comma inside a number.
+IMPORTANT: convert every amount to use a period as the decimal separator (e.g. "9.60", not "9,60"), and remove any thousands separators (spaces, periods, or commas used as thousands separators). Never output a comma inside a number in your output.
 
-IMPORTANT: preserve the normal spacing between words in the description field exactly as a human would write it (e.g. "VIR SCT INST RECU /DE PIERRE MINIGGIO", not "VIRSCTINSTRECU/DEPIERREMINIGGIO"). The source text may have extra or irregular spacing from table formatting — collapse multiple consecutive spaces into one, but always keep at least one space between separate words.
+IMPORTANT: preserve normal spacing between words in the description field exactly as a human would write it (e.g. "VIR SCT INST RECU /DE PIERRE MINIGGIO", not "VIRSCTINSTRECU/DEPIERREMINIGGIO"). The source text may have extra or irregular spacing from table formatting — collapse multiple consecutive spaces into one, but always keep at least one space between separate words.
 
 First line must be exactly:
-STARTING_BALANCE: <number>
-where <number> is the statement's overall starting balance as a plain number with a period decimal separator (e.g. 1234.56).
+STARTING_BALANCE: <number or UNKNOWN>
 
 Second line must be exactly:
-ENDING_BALANCE: <number>
-where <number> is the statement's overall ending balance, same format.
+ENDING_BALANCE: <number or UNKNOWN>
 
 Third line must be this exact header:
-operation_date|description|debit|credit
+operation_date|description|debit|credit|resulting_balance
 
 Then one line per transaction, using these rules:
-- operation_date: the date from the left-most "Date" column, copied EXACTLY as printed (e.g. "09.05" or "07.03.2025") — do not try to add, guess, or compute a year yourself, and do not reformat it; a separate deterministic process handles that afterward. Do not use any "Valeur"/value-date column, even if present.
-- description: the full text of the "Nature des opérations" column only. Do NOT include the "Valeur" column's date in the description — it is a separate column and must be left out entirely, even though it may appear right after the description text on the same line. If a transaction's description wraps onto one or more additional lines below it (these continuation lines have no date at the start and are indented under the description, often containing extra reference details like "/REF ..." or "/MOTIF ..."), append that continuation text to the same transaction's description with a single space, do not create a separate transaction or drop it. Remove any pipe characters if present.
-- debit: the debit amount as a plain number with a period decimal separator (e.g. 3.99), or empty if not a debit
-- credit: the credit amount as a plain number with a period decimal separator, or empty if not a credit
-
-Process transactions in the exact order they appear in the document.
+- operation_date: the transaction's own date, copied EXACTLY as printed (e.g. "09.05", "07.03.2025", or "4 June 2026") — do not add, guess, or compute a year yourself, and do not reformat it; a separate deterministic process handles that. If a table has both a "Date" and a "Valeur"/value-date column, use "Date", not "Valeur".
+- description: the transaction's own description text only. If it wraps onto one or more additional lines (continuation lines with no date at the start, often containing extra reference details), append that continuation text with a single space — do not create a separate transaction or drop it. Do not include a "Valeur" column date or other column's value inside the description. Remove any pipe characters if present.
+- debit: the debit/outgoing amount as a plain positive number with a period decimal separator, or empty if this transaction is a credit
+- credit: the credit/incoming amount as a plain positive number with a period decimal separator, or empty if this transaction is a debit
+- resulting_balance: the account balance shown immediately after this specific transaction, if the document displays one per transaction (as plain positive number, period decimal separator) — leave this empty if the document does not show a per-transaction balance (e.g. because it instead has explicit STARTING_BALANCE/ENDING_BALANCE statements).
 
 Do not skip any transaction, including small commission or fee lines.
 
@@ -157,6 +148,7 @@ if not lines or not lines[0].upper().startswith("STARTING_BALANCE"):
     print(output_text)
     raise SystemExit(1)
 
+
 def parse_number(raw: str):
     """Parse a number that may use either '.' or ',' as the decimal
     separator, and may include thousands separators (spaces, apostrophes,
@@ -180,13 +172,25 @@ def parse_number(raw: str):
     return float(s)
 
 
-try:
-    starting_balance = parse_number(lines[0].split(":", 1)[1])
-    if starting_balance is None:
-        raise ValueError("empty value")
-except (IndexError, ValueError) as e:
-    print(f"ERROR: Could not parse starting balance from '{lines[0]}': {e}")
-    raise SystemExit(1)
+def parse_balance_line(line: str, label: str):
+    """Parse a STARTING_BALANCE / ENDING_BALANCE line, treating the literal
+    value UNKNOWN (the model uses this when the document has no explicit
+    overall balance statement) as None rather than an error.
+    """
+    raw = line.split(":", 1)[1].strip()
+    if raw.upper() == "UNKNOWN":
+        return None
+    try:
+        value = parse_number(raw)
+        if value is None:
+            raise ValueError("empty value")
+        return value
+    except ValueError as e:
+        print(f"ERROR: Could not parse {label} from '{line}': {e}")
+        raise SystemExit(1)
+
+
+starting_balance = parse_balance_line(lines[0], "starting balance")
 
 if len(lines) < 2 or not lines[1].upper().startswith("ENDING_BALANCE"):
     print("ERROR: Model output did not include an ENDING_BALANCE line as expected.")
@@ -194,13 +198,7 @@ if len(lines) < 2 or not lines[1].upper().startswith("ENDING_BALANCE"):
     print(output_text)
     raise SystemExit(1)
 
-try:
-    stated_ending_balance = parse_number(lines[1].split(":", 1)[1])
-    if stated_ending_balance is None:
-        raise ValueError("empty value")
-except (IndexError, ValueError) as e:
-    print(f"ERROR: Could not parse ending balance from '{lines[1]}': {e}")
-    raise SystemExit(1)
+stated_ending_balance = parse_balance_line(lines[1], "ending balance")
 
 header = lines[2].split("|")
 data_lines = lines[3:]
@@ -208,9 +206,12 @@ data_lines = lines[3:]
 
 # Defensive fallback: cross-check the sign of the starting/ending balance
 # against the actual "SOLDE DEBITEUR/CREDITEUR" wording found in the
-# extracted text, and correct it if the model got the sign convention wrong.
-def enforce_balance_sign(value: float, keyword_match) -> float:
-    if keyword_match is None:
+# extracted text (French-specific pattern), and correct it if the model
+# got the sign convention wrong. No-ops harmlessly for documents that
+# don't use this wording (e.g. English statements), or when the balance
+# is unknown (None) at this point.
+def enforce_balance_sign(value, keyword_match):
+    if value is None or keyword_match is None:
         return value
     is_debiteur = keyword_match.group(1).upper() == "DEBITEUR"
     if is_debiteur and value > 0:
@@ -227,38 +228,45 @@ solde_matches = list(solde_pattern.finditer(statement_text))
 first_solde_match = solde_matches[0] if solde_matches else None
 last_solde_match = solde_matches[-1] if solde_matches else None
 
-corrected_starting_balance = enforce_balance_sign(starting_balance, first_solde_match)
-if corrected_starting_balance != starting_balance:
-    print(
-        f"Corrected starting balance sign: model gave {starting_balance:.2f}, "
-        f"but the source text says '{first_solde_match.group(0)}', so using "
-        f"{corrected_starting_balance:.2f} instead."
-    )
-    starting_balance = corrected_starting_balance
+if starting_balance is not None:
+    corrected = enforce_balance_sign(starting_balance, first_solde_match)
+    if corrected != starting_balance:
+        print(
+            f"Corrected starting balance sign: model gave {starting_balance:.2f}, "
+            f"but the source text says '{first_solde_match.group(0)}', so using "
+            f"{corrected:.2f} instead."
+        )
+        starting_balance = corrected
 
-corrected_ending_balance = enforce_balance_sign(stated_ending_balance, last_solde_match)
-if corrected_ending_balance != stated_ending_balance:
-    print(
-        f"Corrected ending balance sign: model gave {stated_ending_balance:.2f}, "
-        f"but the source text says '{last_solde_match.group(0)}', so using "
-        f"{corrected_ending_balance:.2f} instead."
-    )
-    stated_ending_balance = corrected_ending_balance
+if stated_ending_balance is not None:
+    corrected = enforce_balance_sign(stated_ending_balance, last_solde_match)
+    if corrected != stated_ending_balance:
+        print(
+            f"Corrected ending balance sign: model gave {stated_ending_balance:.2f}, "
+            f"but the source text says '{last_solde_match.group(0)}', so using "
+            f"{corrected:.2f} instead."
+        )
+        stated_ending_balance = corrected
 
 
 # --- Statement period + year inference (fully deterministic) ---
-# The model was previously asked to figure out each transaction's year
-# itself (since the table only prints day.month), and this turned out to be
-# unreliable across statements — it would often just echo the raw "DD.MM"
-# text untouched. Instead we extract the statement's real start/end dates
-# here in Python (which we already have from the SOLDE lines above, or a
-# French-language date-range header as a fallback) and apply the year
-# inference rule deterministically for every transaction.
+# The model is never asked to compute a transaction's year itself — day/
+# month-only dates (e.g. BNP's "09.05") need the statement's real period to
+# resolve, which we extract here from whichever explicit source is present
+# (SOLDE lines, or a date-range heading in French or English). Statements
+# where every date already includes its own year (e.g. Wise's "4 June
+# 2026") don't need this at all; normalize_operation_date handles that case
+# directly without consulting the period.
 FRENCH_MONTHS = {
     "janvier": 1, "février": 2, "fevrier": 2, "mars": 3, "avril": 4,
     "mai": 5, "juin": 6, "juillet": 7, "août": 8, "aout": 8,
     "septembre": 9, "octobre": 10, "novembre": 11, "décembre": 12, "decembre": 12,
 }
+ENGLISH_MONTHS = {
+    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+    "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12,
+}
+ALL_MONTHS = {**FRENCH_MONTHS, **ENGLISH_MONTHS}
 
 
 def get_period_from_solde_lines():
@@ -270,20 +278,36 @@ def get_period_from_solde_lines():
 
 
 def get_period_from_header_text():
-    # Fallback for statements without SOLDE lines: look for a French
-    # "du <day> <month name> <year> au <day> <month name> <year>" heading.
+    # Fallback for statements without SOLDE lines: look for a date-range
+    # heading. Try the specific French "du X au Y" phrasing first (most
+    # precise), then fall back to just taking the first two recognizable
+    # "<day> <month name> <year>" dates in document order — this works
+    # generically since the period heading always appears before any
+    # transaction dates, and avoids trying to match a single combined
+    # regex across text that may contain annotations like "[GMT+02:00]"
+    # between the two dates.
     m = re.search(
         r"(?i)du\s+(\d{1,2})\s+(\w+)\s+(\d{4})\s+au\s+(\d{1,2})\s+(\w+)\s+(\d{4})",
         statement_text,
     )
-    if not m:
-        return None, None
-    d1, mo1, y1, d2, mo2, y2 = m.groups()
-    mo1_num = FRENCH_MONTHS.get(mo1.lower())
-    mo2_num = FRENCH_MONTHS.get(mo2.lower())
-    if mo1_num is None or mo2_num is None:
-        return None, None
-    return (int(y1), mo1_num, int(d1)), (int(y2), mo2_num, int(d2))
+    if m:
+        d1, mo1, y1, d2, mo2, y2 = m.groups()
+        mo1_num = ALL_MONTHS.get(mo1.lower())
+        mo2_num = ALL_MONTHS.get(mo2.lower())
+        if mo1_num is not None and mo2_num is not None:
+            return (int(y1), mo1_num, int(d1)), (int(y2), mo2_num, int(d2))
+
+    candidates = []
+    for dm in re.finditer(r"(\d{1,2})\s+([A-Za-zÀ-ÿ]+)\s+(\d{4})", statement_text):
+        d, mo, y = dm.groups()
+        mo_num = ALL_MONTHS.get(mo.lower())
+        if mo_num is not None:
+            candidates.append((int(y), mo_num, int(d)))
+        if len(candidates) >= 2:
+            break
+    if len(candidates) >= 2:
+        return candidates[0], candidates[1]
+    return None, None
 
 
 period_start, period_end = get_period_from_solde_lines()
@@ -292,14 +316,14 @@ if period_start is None or period_end is None:
 
 if period_start is None or period_end is None:
     print(
-        "WARNING: could not determine the statement's date period from the "
-        "text (no SOLDE lines or recognizable date-range header found). "
-        "Transaction dates that only include day.month will be left "
-        "un-converted, which will not match YYYY-MM-DD format."
+        "NOTE: could not determine the statement's date period from an "
+        "explicit balance statement or date-range heading. This is fine as "
+        "long as every transaction date already includes its own year; "
+        "day.month-only dates would be left un-converted otherwise."
     )
 
 
-def infer_year(month: int) -> int | None:
+def infer_year(month: int):
     if period_start is None or period_end is None:
         return None
     start_year, start_month = period_start[0], period_start[1]
@@ -326,6 +350,13 @@ def normalize_operation_date(raw: str) -> str:
     if m:
         day, month, year = m.groups()
         return f"{int(year):04d}-{int(month):02d}-{int(day):02d}"
+    # Textual date with its own explicit year, e.g. "4 June 2026" or "4 juin 2026".
+    m = re.match(r"^(\d{1,2})\s+([A-Za-zÀ-ÿ]+)\s+(\d{4})$", raw)
+    if m:
+        day, month_name, year = m.groups()
+        month_num = ALL_MONTHS.get(month_name.lower())
+        if month_num is not None:
+            return f"{int(year):04d}-{month_num:02d}-{int(day):02d}"
     # DD.MM or DD/MM — no year, infer it from the statement period.
     m = re.match(r"^(\d{1,2})[./-](\d{1,2})$", raw)
     if m:
@@ -340,20 +371,27 @@ def normalize_operation_date(raw: str) -> str:
     return raw
 
 
-# Defensive fallback: cross-check which column (Débit vs Crédit) an amount
-# actually falls under, using the same horizontal-position logic we asked
-# the model to apply, rather than trusting its judgment on this specific
-# point. CPU inference isn't perfectly deterministic even at temperature=0
-# (thread-order floating-point differences can flip a close token choice),
-# and this is exactly the kind of close call that's vulnerable to that — so
-# we verify it against the raw aligned text instead of hoping the model got
-# it right this time.
+# --- Debit/credit column detection (fully deterministic) ---
+# Different providers label these columns differently and some use fixed
+# column positions (BNP's "Débit"/"Crédit") while others use an explicit
+# sign on a single amount (Wise's "-23.56" for outgoing). We try a handful
+# of common label pairs for the position-based approach; the amount_pattern
+# below also allows an optional leading minus sign so a negative "Outgoing"
+# value can still be located and cross-checked.
+COLUMN_LABEL_PAIRS = [
+    (r"D[ée]bit", r"Cr[ée]dit"),
+    (r"Outgoing", r"Incoming"),
+    (r"Withdrawal", r"Deposit"),
+]
+
+
 def find_header_column_positions(text):
     for line in text.split("\n"):
-        debit_match = re.search(r"D[ée]bit", line, re.IGNORECASE)
-        credit_match = re.search(r"Cr[ée]dit", line, re.IGNORECASE)
-        if debit_match and credit_match:
-            return debit_match.start(), credit_match.start()
+        for debit_label, credit_label in COLUMN_LABEL_PAIRS:
+            debit_match = re.search(debit_label, line, re.IGNORECASE)
+            credit_match = re.search(credit_label, line, re.IGNORECASE)
+            if debit_match and credit_match:
+                return debit_match.start(), credit_match.start()
     return None, None
 
 
@@ -361,14 +399,25 @@ DEBIT_COL, CREDIT_COL = find_header_column_positions(statement_text)
 statement_lines = statement_text.split("\n")
 _line_search_cursor = 0
 
+# Detect whether this document encodes debits with an explicit minus sign
+# anywhere at all (e.g. Wise's "-23.56"). If it does, absence of a sign is
+# just as informative as its presence (positive = credit) for this
+# document, and both are more reliable than character-position comparison,
+# which assumes a fixed-width column grid that doesn't hold for every
+# layout (it doesn't for Wise, where numbers sit right after a variable-
+# length description rather than in a true fixed column). If the document
+# never uses a minus sign anywhere (e.g. BNP, all-positive amounts), this
+# stays False and position comparison remains the only available signal.
+DOCUMENT_USES_SIGNED_AMOUNTS = bool(re.search(r"-\d+[.,]\d{2}", statement_text))
+
 
 def locate_amount_column(description: str, amount_str: str):
     """Find the source line for this transaction (by matching a chunk of
     its description text) and determine which column the amount actually
-    sits under, based on its character position relative to the Débit/
-    Crédit header positions. Returns 'debit', 'credit', or None if the
-    line/amount can't be confidently located (in which case the model's
-    original answer is left untouched rather than guessed at).
+    sits under, based on its character position relative to the detected
+    debit/credit-style header positions. Returns 'debit', 'credit', or None
+    if the line/amount/headers can't be confidently located (in which case
+    the model's original answer is left untouched rather than guessed at).
     """
     global _line_search_cursor
     if DEBIT_COL is None or CREDIT_COL is None or not amount_str:
@@ -377,24 +426,52 @@ def locate_amount_column(description: str, amount_str: str):
     if not desc_key:
         return None
     try:
-        amount_pattern = re.escape(f"{float(amount_str):.2f}").replace(r"\.", "[.,]")
+        amount_pattern = r"-?" + re.escape(f"{float(amount_str):.2f}").replace(r"\.", "[.,]")
     except ValueError:
         return None
     for i in range(_line_search_cursor, len(statement_lines)):
         line = statement_lines[i]
         line_key = re.sub(r"\s+", "", line).upper()
         if desc_key and desc_key in line_key:
-            m = re.search(amount_pattern, line)
             _line_search_cursor = i + 1
-            if not m:
+            matches = list(re.finditer(amount_pattern, line))
+            if not matches:
                 return None
-            amount_pos = m.start()
+            # A description can coincidentally contain the same number as
+            # the transaction amount (e.g. Wise's "Card transaction of
+            # 23.56 EUR issued by..." repeats the amount in prose before
+            # the actual column value appears later in the line). Picking
+            # the first match can grab that coincidental mention instead of
+            # the real column-aligned value, so pick whichever match sits
+            # closest to either detected column position instead.
+            best_match = min(
+                matches,
+                key=lambda m: min(abs(m.start() - DEBIT_COL), abs(m.start() - CREDIT_COL)),
+            )
+            # An explicit minus sign directly on the matched number (e.g.
+            # Wise's "-23.56" for outgoing amounts) is a much more reliable
+            # signal than character-position comparison, which assumes a
+            # fixed-width column grid — that assumption held for BNP's
+            # bordered table but doesn't hold for layouts where numbers sit
+            # right after a variable-length description rather than in a
+            # true fixed column (as seen with Wise). If this document uses
+            # signed amounts anywhere, trust the sign fully (its absence on
+            # a match means credit, not just "no evidence either way") and
+            # skip position comparison entirely. Only documents that never
+            # use a sign at all (e.g. BNP) fall back to position.
+            if DOCUMENT_USES_SIGNED_AMOUNTS:
+                return "debit" if best_match.group(0).startswith("-") else "credit"
+            amount_pos = best_match.start()
             return "debit" if abs(amount_pos - DEBIT_COL) < abs(amount_pos - CREDIT_COL) else "credit"
     return None
 
-# --- Step 4: parse rows and compute running balance deterministically ---
-transactions = []
-running_balance = starting_balance
+
+# --- Step 4: parse every row (pass 1, unordered) ---
+# We no longer trust the model's row order to already be chronological —
+# some statements (e.g. Wise) list transactions newest-first, others
+# oldest-first. Every row is parsed and date-normalized first; sorting and
+# running-balance computation happen afterward as a second pass.
+parsed_rows = []
 
 for line in data_lines:
     fields = line.split("|")
@@ -406,13 +483,6 @@ for line in data_lines:
     # description despite the prompt instruction not to include it.
     description = re.sub(r"\s+\d{2}\.\d{2}$", "", description).strip()
 
-    # Defensive fallback: even with the prompt instruction, a small model
-    # can occasionally still echo a "SOLDE DEBITEUR/CREDITEUR AU ..." balance
-    # line, or a "TOTAL DES OPERATIONS" summary line, as if it were a
-    # transaction row. Both the starting and ending balance values were
-    # already captured above from the STARTING_BALANCE / ENDING_BALANCE
-    # lines, so it's safe to drop any stray summary line here without
-    # losing that information.
     if re.match(r"(?i)^SOLDE\s+(DEBITEUR|CREDITEUR)\s+AU\b", description):
         print(f"Skipping balance-summary line mistakenly included as a transaction: '{description}'")
         continue
@@ -430,14 +500,14 @@ for line in data_lines:
         raise SystemExit(1)
 
     # Cross-check the column assignment against the raw text rather than
-    # trusting the model outright (see locate_amount_column above).
+    # trusting the model outright.
     amount_str = debit_str or credit_str
     detected_column = locate_amount_column(description, amount_str)
     if detected_column == "credit" and debit_str and not credit_str:
         print(
             f"Corrected debit/credit column for '{description}': model said "
             f"debit, but its position in the source text lines up with the "
-            f"Crédit column."
+            f"credit column."
         )
         debit_str, credit_str = "", debit_str
         debit, credit = 0.0, debit
@@ -445,20 +515,92 @@ for line in data_lines:
         print(
             f"Corrected debit/credit column for '{description}': model said "
             f"credit, but its position in the source text lines up with the "
-            f"Débit column."
+            f"debit column."
         )
         credit_str, debit_str = "", credit_str
         credit, debit = 0.0, credit
 
-    row_starting_balance = running_balance
-    running_balance = running_balance - debit + credit
+    resulting_balance_str = row.get("resulting_balance", "").strip()
+    try:
+        resulting_balance = parse_number(resulting_balance_str)
+    except ValueError:
+        resulting_balance = None
 
-    transactions.append(
+    parsed_rows.append(
         {
             "operation_date": normalize_operation_date(row.get("operation_date", "").strip()),
             "description": description,
-            "debit": f"{debit:.2f}" if debit_str else "",
-            "credit": f"{credit:.2f}" if credit_str else "",
+            "debit_str": debit_str,
+            "credit_str": credit_str,
+            "debit": debit,
+            "credit": credit,
+            "resulting_balance": resulting_balance,
+        }
+    )
+
+# --- Ensure chronological (oldest first) order, regardless of source order ---
+# Some statements list transactions oldest-first, others newest-first. A
+# plain sort-by-date would fix the overall direction but loses same-day
+# relative ordering (multiple transactions sharing one date get collapsed
+# to sort-stable order, which is only correct if the source already
+# happened to list them oldest-first within that day too). Instead, detect
+# the document's overall direction and reverse the whole list if needed —
+# this preserves the model's true relative transcription order (including
+# same-day order) rather than discarding it.
+def _looks_ascending(rows):
+    iso_dates = [r["operation_date"] for r in rows if re.match(r"^\d{4}-\d{2}-\d{2}$", r["operation_date"])]
+    if len(iso_dates) < 2:
+        return True  # not enough evidence to tell; assume already correct
+    return iso_dates[0] <= iso_dates[-1]
+
+
+if not _looks_ascending(parsed_rows):
+    parsed_rows.reverse()
+
+# --- Determine the starting balance if the document didn't state one explicitly ---
+if starting_balance is None:
+    anchor = next((r for r in parsed_rows if r["resulting_balance"] is not None), None)
+    if anchor is not None:
+        starting_balance = anchor["resulting_balance"] - anchor["credit"] + anchor["debit"]
+        print(
+            f"No explicit starting balance found in the document; derived "
+            f"{starting_balance:.2f} from the earliest transaction's own "
+            f"reported balance ({anchor['resulting_balance']:.2f}) and its "
+            f"debit/credit."
+        )
+    else:
+        starting_balance = 0.0
+        print(
+            "WARNING: could not determine a starting balance from either an "
+            "explicit balance statement or a per-transaction running "
+            "balance. Defaulting to 0.00 — starting_balance/ending_balance "
+            "in the output will reflect only the net change across "
+            "transactions, not the real account balance."
+        )
+
+if stated_ending_balance is None:
+    anchor = next((r for r in reversed(parsed_rows) if r["resulting_balance"] is not None), None)
+    if anchor is not None:
+        stated_ending_balance = anchor["resulting_balance"]
+        print(
+            f"No explicit ending balance found in the document; using the "
+            f"most recent transaction's own reported balance "
+            f"({stated_ending_balance:.2f}) instead."
+        )
+
+# --- Step 5: compute running balance deterministically, in chronological order ---
+transactions = []
+running_balance = starting_balance
+
+for r in parsed_rows:
+    row_starting_balance = running_balance
+    running_balance = running_balance - r["debit"] + r["credit"]
+    transactions.append(
+        {
+            "operation_date": r["operation_date"],
+            "description": r["description"],
+            "debit": f"{r['debit']:.2f}" if r["debit_str"] else "",
+            "credit": f"{r['credit']:.2f}" if r["credit_str"] else "",
             "starting_balance": f"{row_starting_balance:.2f}",
             "ending_balance": f"{running_balance:.2f}",
         }
@@ -469,12 +611,15 @@ with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
 
 print(f"Saved {len(transactions)} transactions to {OUTPUT_PATH}")
 print(f"Computed ending balance: {running_balance:.2f}")
-print(f"Statement's stated ending balance: {stated_ending_balance:.2f}")
 
-if abs(running_balance - stated_ending_balance) > 0.01:
-    print(
-        "WARNING: computed ending balance does not match the statement's "
-        "stated ending balance. This usually means a transaction was missed, "
-        "misread, or a debit/credit was misclassified — review "
-        f"{OUTPUT_PATH} against the original PDF before trusting it."
-    )
+if stated_ending_balance is not None:
+    print(f"Statement's stated/derived ending balance: {stated_ending_balance:.2f}")
+    if abs(running_balance - stated_ending_balance) > 0.01:
+        print(
+            "WARNING: computed ending balance does not match the statement's "
+            "stated ending balance. This usually means a transaction was "
+            "missed, misread, or a debit/credit was misclassified — review "
+            f"{OUTPUT_PATH} against the original PDF before trusting it."
+        )
+else:
+    print("No ending balance could be determined from the document to validate against.")

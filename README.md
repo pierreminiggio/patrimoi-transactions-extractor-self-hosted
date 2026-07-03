@@ -10,21 +10,28 @@ Actions runner. No AI API key or external inference provider required.
 | | Hosted version | Self-hosted version |
 |---|---|---|
 | Model | Gemini 2.5 Flash (API) | Qwen2.5-7B-Instruct, 4-bit quantized (GGUF) |
-| PDF handling | Native vision — reads raw PDF bytes | Text extracted first via `pdfplumber`, then fed to the LLM as text |
-| Running balance | Computed by the model | Computed deterministically in Python from the extracted debit/credit values and the model-extracted starting balance |
+| PDF handling | Native vision — reads raw PDF bytes | Text extracted first via `pdfplumber` (layout-preserving), then fed to the LLM as text |
+| Running balance | Computed by the model | Computed deterministically in Python from extracted debit/credit values |
+| Transaction order | Trusted from the model | Detected and normalized (oldest-first) deterministically in Python, regardless of source order |
+| Dates | Converted by the model | Parsed and year-inferred deterministically in Python (numeric and month-name formats, multiple languages) |
+| Debit/credit column | Determined by the model | Cross-checked deterministically against the raw text (column position or explicit sign, whichever the document uses) |
 | Secrets needed | `GEMINI_API_KEY`, `PATRIMOI_TOKEN` | `PATRIMOI_TOKEN` only |
 | Speed | Seconds | Several minutes per statement (CPU-only inference) |
 
-### Why the running balance is computed in Python, not by the model
+### Statement formats this has been tested against
 
-Gemini's larger scale makes it reasonably reliable at carrying a running sum
-across many rows. A 7B model on CPU is more prone to arithmetic drift over
-a long transaction list. So the local model is only asked to extract the
-raw fields it's actually good at (dates, descriptions, debit/credit amounts,
-and the statement's single starting balance) — the sequential balance math
-is then done deterministically in the script. This produces the same
-`transactions.json` shape as the hosted version, just computed more
-reliably.
+This started out tuned specifically for one bank's French statement format, then was generalized after testing against a second, very differently structured statement (English, block-based layout, reverse-chronological, explicit per-transaction running balance instead of summary balance lines). The extraction logic now handles both patterns generically rather than hardcoding either bank's vocabulary as a requirement:
+
+- **Balance anchor**: either an explicit "balance as of \<date\>" statement (in whatever language/wording — French "SOLDE DEBITEUR/CREDITEUR AU", English "balance as of", etc.), *or* a running balance shown per-transaction (in which case the overall starting/ending balance is derived from the earliest/latest transaction's own reported balance instead).
+- **Debit vs. credit**: either a fixed two-column layout (detected by comparing an amount's horizontal position to header words like "Débit"/"Crédit", "Debit"/"Credit", "Outgoing"/"Incoming", "Withdrawal"/"Deposit"), *or* an explicit sign on a single amount column (a statement that uses signs anywhere is assumed to use them consistently, so an unsigned amount is treated as a credit).
+- **Dates**: numeric (`DD.MM`, `DD.MM.YYYY`) with year inferred from the statement's period when not printed, *or* fully-written dates with their own explicit year (`4 June 2026`, French or English month names).
+- **Transaction order**: the model transcribes rows in whatever order the source document uses; Python detects the overall direction (by comparing the first and last parsed dates) and reverses the list if the document is newest-first, rather than trusting the model to reorder anything itself.
+
+This is still not a universal parser — a statement with a genuinely novel structure (e.g. a third balance-anchor style, or a language neither French nor English) may need another round of generalization the same way this one did. The failure signal to watch for is the `WARNING: computed ending balance does not match...` message; treat that as "review this statement's format," not just "something's randomly wrong."
+
+### Why so much of this is deterministic Python, not model output
+
+Across testing on real statements, small local models proved reliably weak at exactly the same handful of things: multi-step arithmetic (running balances), sign conventions, calendar math (year inference), and maintaining a specific row order across a long transcription. Every one of those is now computed in Python from the model's raw transcription instead of trusted to the model's own reasoning — the model's job is narrowed to locating and transcribing table cells, which is what it's actually reliable at.
 
 ### Why text extraction instead of vision
 
