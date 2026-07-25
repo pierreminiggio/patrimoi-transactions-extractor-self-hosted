@@ -64,6 +64,17 @@ jobs:
             -o account.download \
             "${SOURCE_URL}"
 
+          FILE_SIZE=$(stat -c%s account.download)
+          echo "Downloaded ${FILE_SIZE} bytes"
+          if [ "${FILE_SIZE}" -eq 0 ]; then
+            echo "ERROR: download returned HTTP success but an empty (0 byte) body."
+            echo "curl -f only catches non-2xx statuses, not a 2xx with no content."
+            echo "Check that PATRIMOI_TOKEN is set and valid, and that the URL is correct:"
+            echo "${SOURCE_URL}"
+            cat response_headers.txt
+            exit 1
+          fi
+
           CONTENT_TYPE=$(grep -i '^content-type:' response_headers.txt | tail -1 | cut -d':' -f2- | tr -d '\r' | xargs)
           echo "Downloaded Content-Type: ${CONTENT_TYPE:-<none>}"
           echo "SOURCE_CONTENT_TYPE=${CONTENT_TYPE}" >> "$GITHUB_ENV"

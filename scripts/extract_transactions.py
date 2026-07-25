@@ -18,6 +18,20 @@ if len(sys.argv) < 3:
 INPUT_PATH = sys.argv[1]
 OUTPUT_PATH = sys.argv[2]
 
+_size = os.path.getsize(INPUT_PATH)
+if _size == 0:
+    print(
+        f"ERROR: Downloaded file '{INPUT_PATH}' is 0 bytes — the statement "
+        "itself was never downloaded. This is not a parsing problem; the "
+        "download step returned an empty body. Likely causes: an expired or "
+        "missing auth token (PATRIMOI_TOKEN), a wrong/expired statement URL, "
+        "or the source endpoint returning 200 with an empty response for this "
+        "particular URL. Check the 'Download bank statement' step's logs "
+        "(Content-Type printed there) before re-running."
+    )
+    raise SystemExit(1)
+print(f"Input file: {INPUT_PATH} ({_size} bytes), Content-Type hint: {CONTENT_TYPE or '<none>'}")
+
 
 def run_via_llm(source_text: str):
     output_text = llm_extract.run_llm(source_text, MODEL_PATH, N_CTX)
@@ -37,6 +51,20 @@ def handle_pdf(path: str):
 
 
 def handle_csv(path: str):
+    fieldnames, row_count = csv_source.inspect(path)
+    print(f"CSV header detected: {fieldnames}")
+    print(f"CSV data rows detected: {row_count}")
+    if not fieldnames or row_count == 0:
+        print(
+            "ERROR: The downloaded file decodes as text but doesn't look like "
+            "a CSV with a header row and at least one data row. If this is "
+            "unexpected, check the 'Download bank statement' step's logs — "
+            "this usually means the download returned something other than "
+            "the actual statement (an error page, a redirect target, etc.) "
+            "rather than a genuine CSV-parsing failure."
+        )
+        raise SystemExit(1)
+
     # Tier 1: known exact provider format (e.g. N26) — pure Python, no LLM.
     result = csv_source.try_known_format(path)
     if result is not None:
@@ -59,9 +87,10 @@ def handle_csv(path: str):
 
     # Tier 3: fall back to the LLM, same treatment as PDF text.
     print(
-        "Could not confidently parse this CSV deterministically (unrecognized "
-        "provider, and generic column guesses didn't validate against the "
-        "data). Falling back to the local LLM."
+        "Header and rows were found, but neither a known provider format nor "
+        "a generic column guess could be confidently matched/validated "
+        f"against the {row_count} data row(s) under header {fieldnames}. "
+        "Falling back to the local LLM."
     )
     statement_text = csv_source.read_text(path)
     if not statement_text.strip():

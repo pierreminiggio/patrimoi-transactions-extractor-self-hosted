@@ -119,6 +119,13 @@ KNOWN_FORMATS = [
 ]
 
 
+def inspect(path: str):
+    """Returns (fieldnames, row_count) for diagnostic logging, without
+    attempting any parsing/interpretation."""
+    fieldnames, rows = _read_rows(path)
+    return fieldnames, len(rows)
+
+
 def try_known_format(path: str):
     """Returns (parsed_rows, starting_balance, stated_ending_balance, format_name)
     or None if no known format matches this file's header.
