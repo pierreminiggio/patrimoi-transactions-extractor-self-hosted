@@ -5,12 +5,46 @@ input, same output artifact — but instead of calling the Gemini API, the
 workflow downloads a small open-weight LLM and runs it locally on the GitHub
 Actions runner. No AI API key or external inference provider required.
 
+## PDF or CSV — auto-detected
+
+The workflow accepts either a PDF or a CSV bank statement at the same input
+URL. The type is detected automatically: the download step captures the
+response's `Content-Type` header, and the script cross-checks that against
+the file's own content (a PDF always starts with the `%PDF-` signature). If
+the header and the actual bytes disagree, the bytes win — a generic or wrong
+`Content-Type` (common with signed storage URLs) never causes a
+misclassification.
+
+CSV files are handled in three tiers, in order, and only fall through to the
+next tier if the previous one can't confidently do the job:
+
+1. **Known exact format** — currently N26's CSV export, matched by its
+   header row and parsed with format-specific knowledge of what each column
+   means (signed `Amount (EUR)`, `Partner Name` + `Payment Reference` for
+   the description, etc). Pure Python, the model is never invoked.
+2. **Generic column guessing** — for CSVs from a provider that isn't
+   specifically supported, the script guesses which columns are the date,
+   description, and amount (or separate debit/credit columns) from header
+   names in several languages, then *validates* that guess by actually
+   parsing a sample of the real rows. It only proceeds deterministically if
+   that validation is confident (≥90% of sampled rows parse cleanly). Still
+   pure Python.
+3. **LLM fallback** — only if neither of the above could confidently map
+   the columns does the CSV go through the same local-LLM pipeline used for
+   PDFs (the raw CSV text is fed to the model instead of PDF-extracted
+   text).
+
+Add a new provider to tier 1 any time by adding a header-matcher and a
+parser function to `KNOWN_FORMATS` in `scripts/csv_source.py`.
+
 ## How it differs from the hosted version
 
 | | Hosted version | Self-hosted version |
 |---|---|---|
 | Model | Gemini 2.5 Flash (API) | Qwen2.5-7B-Instruct, 4-bit quantized (GGUF) |
+| Input formats | PDF only | PDF or CSV (auto-detected) |
 | PDF handling | Native vision — reads raw PDF bytes | Text extracted first via `pdfplumber` (layout-preserving), then fed to the LLM as text |
+| CSV handling | N/A | Parsed deterministically in Python where possible (known or heuristically-inferred columns); LLM only as a last resort |
 | Running balance | Computed by the model | Computed deterministically in Python from extracted debit/credit values |
 | Transaction order | Trusted from the model | Detected and normalized (oldest-first) deterministically in Python, regardless of source order |
 | Dates | Converted by the model | Parsed and year-inferred deterministically in Python (numeric and month-name formats, multiple languages) |
@@ -73,15 +107,17 @@ first run pays the download cost.
 ## Setup
 
 1. Set the `PATRIMOI_TOKEN` repository secret (same token used to download
-   the bank statement PDF as in the hosted version). No AI API key needed.
+   the bank statement in the hosted version). No AI API key needed.
 2. Trigger the workflow manually (`workflow_dispatch`) with the
-   `patrimoi_bank_statement` input set to the PDF URL.
+   `patrimoi_bank_statement` input set to the statement URL — PDF or CSV,
+   the workflow detects which.
 3. Download the `transactions` artifact once the run completes.
 
 ## Usage
 
 ```
 gh workflow run extract-transactions.yml -f patrimoi_bank_statement="https://.../statement.pdf"
+gh workflow run extract-transactions.yml -f patrimoi_bank_statement="https://.../export.csv"
 ```
 
 ## Output
@@ -103,6 +139,15 @@ objects with the following keys per transaction:
 ## Known limitations
 
 - Scanned/image-only PDFs are not supported (no OCR).
+- CSV exports rarely state an account balance anywhere in the file. Unless a
+  balance-like column is present and detected, `starting_balance` defaults
+  to `0.00` and the output reflects only the net change across transactions
+  — not the real account balance (a `WARNING` is printed when this happens).
+- The generic CSV column-guesser is a heuristic, not magic: it validates
+  itself against a sample of the real data before trusting its own guess,
+  but an unusual or heavily abbreviated header layout can still fall
+  through to the (slow) LLM tier, or in rare cases misassign a column.
+  Spot-check output on CSV formats it hasn't seen before.
 - CPU inference is slow — expect several minutes per statement, well within
   the 6-hour GitHub Actions job limit but not suitable for near-real-time use.
 - Small local models can still occasionally misread poorly formatted tables;

@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       patrimoi_bank_statement:
-        description: "URL to the Patrimoi bank statement PDF"
+        description: "URL to the Patrimoi bank statement (PDF or CSV)"
         required: true
         type: string
 
@@ -50,21 +50,30 @@ jobs:
             exit 1
           fi
 
-      - name: Download bank statement PDF
+      - name: Download bank statement (PDF or CSV)
         env:
-          PDF_URL: ${{ inputs.patrimoi_bank_statement }}
+          SOURCE_URL: ${{ inputs.patrimoi_bank_statement }}
           PATRIMOI_TOKEN: ${{ secrets.PATRIMOI_TOKEN }}
         run: |
+          # Downloaded without assuming a file extension — the script
+          # figures out whether this is a PDF or a CSV itself, using the
+          # Content-Type header captured below plus the file's own content.
           curl -sSL -f \
             -H "Authorization: Bearer ${PATRIMOI_TOKEN}" \
-            -o account.pdf \
-            "${PDF_URL}"
+            -D response_headers.txt \
+            -o account.download \
+            "${SOURCE_URL}"
 
-      - name: Extract transactions (local LLM, no external API calls)
+          CONTENT_TYPE=$(grep -i '^content-type:' response_headers.txt | tail -1 | cut -d':' -f2- | tr -d '\r' | xargs)
+          echo "Downloaded Content-Type: ${CONTENT_TYPE:-<none>}"
+          echo "SOURCE_CONTENT_TYPE=${CONTENT_TYPE}" >> "$GITHUB_ENV"
+
+      - name: Extract transactions (local LLM only used as a fallback, no external API calls)
         env:
           MODEL_PATH: ${{ env.MODEL_PATH }}
+          SOURCE_CONTENT_TYPE: ${{ env.SOURCE_CONTENT_TYPE }}
         run: |
-          python scripts/extract_transactions.py account.pdf transactions.json
+          python scripts/extract_transactions.py account.download transactions.json
 
       - name: Upload transactions artifact
         uses: actions/upload-artifact@v4
