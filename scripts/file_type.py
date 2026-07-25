@@ -6,44 +6,29 @@ many signed-URL/storage links send regardless of actual content), fall back
 to sniffing the file's own bytes. If the header and the file's actual bytes
 disagree, the bytes win — a wrong/generic header shouldn't be trusted over
 directly-observable content.
-"""
 
-import csv
+Since this pipeline only ever expects a PDF or a CSV, detection is a binary
+choice: PDF magic bytes (%PDF-) mean PDF; anything else that decodes as text
+is treated as CSV and handed to the CSV parsing tiers, which are better
+placed than this module to judge whether the content actually makes sense
+as a statement (and will say so clearly if not). Only genuinely undecodable
+binary content — which usually means the download itself went wrong (auth
+failure, wrong URL, HTML error page served as bytes, etc.) — is a hard
+failure here, and it prints diagnostics to make that easy to spot in logs.
+"""
 
 
 def _sniff_is_pdf(head: bytes) -> bool:
     return head.lstrip(b"\xef\xbb\xbf").startswith(b"%PDF-")
 
 
-def _sniff_is_csv(path: str) -> bool:
-    try:
-        with open(path, "rb") as f:
-            raw = f.read(8192)
-        for encoding in ("utf-8-sig", "utf-8", "latin-1"):
-            try:
-                text = raw.decode(encoding)
-                break
-            except UnicodeDecodeError:
-                continue
-        else:
-            return False
-    except OSError:
-        return False
-
-    sample = text[:4096]
-    if not sample.strip():
-        return False
-    try:
-        csv.Sniffer().sniff(sample, delimiters=",;\t")
-        return True
-    except csv.Error:
-        # Fall back to a crude check: does the first line have multiple
-        # consistent delimiter-separated fields?
-        first_line = sample.splitlines()[0] if sample.splitlines() else ""
-        for delim in (",", ";", "\t"):
-            if first_line.count(delim) >= 1:
-                return True
-        return False
+def _decode_text(raw: bytes):
+    for encoding in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return None
 
 
 def _content_type_hint(content_type: str):
@@ -59,7 +44,7 @@ def _content_type_hint(content_type: str):
 
 def detect_file_type(path: str, content_type: str = None) -> str:
     with open(path, "rb") as f:
-        head = f.read(2048)
+        head = f.read(8192)
 
     is_pdf_by_magic = _sniff_is_pdf(head)
     hint = _content_type_hint(content_type)
@@ -78,15 +63,22 @@ def detect_file_type(path: str, content_type: str = None) -> str:
             "WARNING: Content-Type header said PDF but the file content does "
             "not start with a PDF signature; falling back to content sniffing."
         )
-    elif hint == "csv":
+
+    text = _decode_text(head)
+    if text is not None:
         return "csv"
 
-    if _sniff_is_csv(path):
-        return "csv"
+    import os
 
     print(
-        "ERROR: Could not determine whether the downloaded file is a PDF or "
-        "a CSV (Content-Type was missing/ambiguous, and the content doesn't "
-        "look like either a PDF or a well-formed CSV)."
+        "ERROR: Downloaded file is neither a PDF (no %PDF- signature) nor "
+        "decodable as text, so it can't be a CSV either. This usually means "
+        "the download itself failed silently — e.g. wrong/expired auth token, "
+        "wrong URL, or the server returned an HTML/JSON error page instead of "
+        "the actual statement (curl -f would normally catch a non-2xx status, "
+        "but not a 2xx response with unexpected content)."
     )
+    print(f"  Content-Type header seen: {content_type or '<none>'}")
+    print(f"  Downloaded file size: {os.path.getsize(path)} bytes")
+    print(f"  First bytes (hex): {head[:64].hex()}")
     raise SystemExit(1)
