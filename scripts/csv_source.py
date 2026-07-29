@@ -1,7 +1,7 @@
 """CSV handling, in two deterministic tiers before anything touches the LLM:
 
-  1. Known exact provider formats (currently: N26) — matched by header,
-     parsed with format-specific knowledge of what each column means.
+  1. Known exact provider formats (currently: N26, Lydia) — matched by
+     header, parsed with format-specific knowledge of what each column means.
   2. A generic heuristic parser for CSVs that don't match a known format —
      guesses which columns are the date/description/amount(s) from header
      names, then validates the guess by actually trying to parse a sample
@@ -13,6 +13,7 @@ the LLM (see llm_extract.py), same as for PDFs.
 
 import csv
 import re
+import unicodedata
 
 from common import parse_number, normalize_operation_date
 
@@ -119,9 +120,133 @@ KNOWN_FORMATS = [
 ]
 
 
+# --- Tier 1b: Lydia (French neobank, BIC LYDIFRP2XXX) -------------------
+#
+# Lydia's account-statement CSV export isn't a plain table: it starts with
+# a block of free-form "key,value" metadata lines (account holder, IBAN,
+# BIC, statement period, opening/closing balance) before the actual
+# transaction table header appears further down, e.g.:
+#
+#   Firstname Lastname,Pierre Miniggio
+#   ...
+#   Solde du compte au 01/02/2026,0.00 €
+#   Solde du compte au 28/02/2026,0.00 €
+#   Date,Libellé,Débit,Crédit,Solde
+#   05/02/2026,Rechargement par carte,,100.00,100.00
+#
+# This breaks the assumption (used by both _read_rows and the generic
+# tier-2 guesser) that the header is on the first line, so it needs its
+# own detection that scans for the real header row instead.
+
+LYDIA_HEADER_TOKENS = {"date", "libelle", "debit", "credit", "solde"}
+LYDIA_BALANCE_LABEL_RE = re.compile(r"^solde du compte au\b", re.IGNORECASE)
+
+
+def _strip_accents(s: str) -> str:
+    normalized = unicodedata.normalize("NFKD", s)
+    return "".join(c for c in normalized if not unicodedata.combining(c))
+
+
+def _normalize_header_token(s: str) -> str:
+    return _strip_accents((s or "").strip().strip('"').lower())
+
+
+def _find_lydia_table(text: str):
+    """Scan the first lines of the file for the Lydia transaction header
+    row ('Date,Libellé,Débit,Crédit,Solde', accent/case-insensitive).
+    Returns (header_line_index, delimiter, lines) or None if not found.
+    """
+    lines = text.splitlines()
+    for i, line in enumerate(lines[:30]):
+        for delim in (",", ";"):
+            parts = [_normalize_header_token(p) for p in line.split(delim) if p.strip()]
+            if set(parts) == LYDIA_HEADER_TOKENS:
+                return i, delim, lines
+    return None
+
+
+def _matches_lydia(path: str) -> bool:
+    return _find_lydia_table(read_text(path)) is not None
+
+
+def _parse_lydia(path: str):
+    text = read_text(path)
+    found = _find_lydia_table(text)
+    if found is None:
+        return [], None, None
+    header_idx, delim, lines = found
+
+    # The two "Solde du compte au DD/MM/YYYY,<amount>" metadata lines are
+    # the opening and closing balance, in that order.
+    balances = []
+    for line in lines[:header_idx]:
+        parts = line.split(delim, 1)
+        if len(parts) != 2:
+            continue
+        label, value = parts
+        if LYDIA_BALANCE_LABEL_RE.match(label.strip()):
+            amount_str = value.replace("€", "").strip()
+            try:
+                amount = parse_number(amount_str)
+            except ValueError:
+                continue
+            if amount is not None:
+                balances.append(amount)
+    starting_balance = balances[0] if balances else None
+    stated_ending_balance = balances[-1] if len(balances) > 1 else None
+
+    header_fields = [f.strip() for f in lines[header_idx].split(delim)]
+    key_map = {_normalize_header_token(f): f for f in header_fields}
+    reader = csv.DictReader(lines[header_idx + 1:], fieldnames=header_fields, delimiter=delim)
+
+    def get(row, name):
+        return (row.get(key_map.get(name, ""), "") or "").strip()
+
+    parsed_rows = []
+    for row in reader:
+        date_raw = get(row, "date")
+        if not date_raw:
+            continue
+
+        description = get(row, "libelle") or "Transaction"
+        debit_str = get(row, "debit")
+        credit_str = get(row, "credit")
+        solde_str = get(row, "solde")
+
+        try:
+            # Lydia reports debits as negative numbers in their own column;
+            # store the magnitude, consistent with the other known formats.
+            debit = abs(parse_number(debit_str) or 0.0)
+            credit = parse_number(credit_str) or 0.0
+            resulting_balance = parse_number(solde_str) if solde_str else None
+        except ValueError:
+            print(f"WARNING: could not parse Lydia amounts on row with date {date_raw}; skipping row.")
+            continue
+
+        parsed_rows.append(
+            {
+                "operation_date": normalize_operation_date(date_raw),
+                "description": description,
+                "debit_str": debit_str,
+                "credit_str": credit_str,
+                "debit": debit,
+                "credit": credit,
+                "resulting_balance": resulting_balance,
+            }
+        )
+
+    return parsed_rows, starting_balance, stated_ending_balance
+
+
 def inspect(path: str):
     """Returns (fieldnames, row_count) for diagnostic logging, without
     attempting any parsing/interpretation."""
+    lydia = _find_lydia_table(read_text(path))
+    if lydia is not None:
+        header_idx, delim, lines = lydia
+        fieldnames = [f.strip() for f in lines[header_idx].split(delim)]
+        row_count = sum(1 for line in lines[header_idx + 1:] if line.strip())
+        return fieldnames, row_count
     fieldnames, rows = _read_rows(path)
     return fieldnames, len(rows)
 
@@ -130,6 +255,10 @@ def try_known_format(path: str):
     """Returns (parsed_rows, starting_balance, stated_ending_balance, format_name)
     or None if no known format matches this file's header.
     """
+    if _matches_lydia(path):
+        parsed_rows, starting_balance, stated_ending_balance = _parse_lydia(path)
+        return parsed_rows, starting_balance, stated_ending_balance, "Lydia"
+
     fieldnames, _ = _read_rows(path)
     if not fieldnames:
         return None

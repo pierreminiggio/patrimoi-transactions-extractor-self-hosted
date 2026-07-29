@@ -18,10 +18,13 @@ misclassification.
 CSV files are handled in three tiers, in order, and only fall through to the
 next tier if the previous one can't confidently do the job:
 
-1. **Known exact format** — currently N26's CSV export, matched by its
-   header row and parsed with format-specific knowledge of what each column
-   means (signed `Amount (EUR)`, `Partner Name` + `Payment Reference` for
-   the description, etc). Pure Python, the model is never invoked.
+1. **Known exact format** — currently N26's and Lydia's CSV exports, each
+   matched by their header row and parsed with format-specific knowledge of
+   what each column means (N26: signed `Amount (EUR)`, `Partner Name` +
+   `Payment Reference` for the description; Lydia: a metadata preamble
+   followed by `Date,Libellé,Débit,Crédit,Solde`, with the opening/closing
+   balance pulled from the `Solde du compte au <date>` lines). Pure Python,
+   the model is never invoked.
 2. **Generic column guessing** — for CSVs from a provider that isn't
    specifically supported, the script guesses which columns are the date,
    description, and amount (or separate debit/credit columns) from header
