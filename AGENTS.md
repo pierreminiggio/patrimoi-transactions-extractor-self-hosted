@@ -13,11 +13,21 @@ Every bug fix and every feature follows test-driven development:
 3. **Refactor / regress** — run the full suite and make sure nothing else broke.
 
 Do not change production code without a test that failed before the change.
-Tests live in `scripts/tests/` and run from `scripts/` with:
+Tests live in `scripts/tests/`. Run them from the project root with the bash
+script (Git Bash on Windows, or macOS/Linux):
 
-    sh run-tests
+    ./run-tests
 
-(equivalent to `python -m unittest discover -s tests -v`).
+or with the equivalent cross-platform command:
+
+    python -m unittest discover -s scripts/tests -v
+
+Note: `scripts/run-tests` is a one-line shell snippet, not a Python script, so
+`python scripts/run-tests` does not work.
+
+Expected noise: some tests deliberately print log lines (e.g. "Realigned
+malformed model output line", "ERROR: Could not make sense of ..."). That is
+normal as long as the run ends with `OK`.
 
 Tests must not need the model, the network or real bank data. Use sanitized
 statement text and hand-written model outputs (see

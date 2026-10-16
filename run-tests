@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Run the whole test suite from anywhere: ./run-tests [extra unittest args]
+set -euo pipefail
+
+cd "$(dirname "$0")"
+
+PYTHON="${PYTHON:-python}"
+command -v "$PYTHON" >/dev/null 2>&1 || PYTHON=python3
+
+exec "$PYTHON" -m unittest discover -s scripts/tests -v "$@"
