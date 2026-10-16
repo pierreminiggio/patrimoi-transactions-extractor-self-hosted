@@ -128,6 +128,59 @@ def _find_header_column_positions(text):
     return None, None
 
 
+_DATE_FIELD_RE = re.compile(r"^\d{1,2}[./-]\d{1,2}([./-]\d{4})?$|^\d{4}-\d{2}-\d{2}$|^\d{1,2}\s+[A-Za-zÀ-ÿ]+\s+\d{4}$")
+_AMOUNT_FIELD_RE = re.compile(r"^-?\d[\d\s.,']*$")
+
+
+def _realign_row_fields(fields, header):
+    """Small models occasionally emit a row with the right content but the
+    wrong shape (e.g. a spurious leading number that shifts every field one
+    slot to the right). Re-anchor on the two fields that can be recognized
+    unambiguously — the date and the description — and read the amounts
+    from what follows the description. Anything before the date is dropped:
+    it is not part of the row, and guessing what it meant (a balance? a
+    total line leaking in?) would risk corrupting the data.
+
+    Returns a dict keyed by `header`, or None if the row can't be anchored.
+    """
+    fields = [f.strip() for f in fields]
+    desc_idx = next(
+        (i for i, f in enumerate(fields) if re.search(r"[A-Za-zÀ-ÿ]{2,}", f) and not _DATE_FIELD_RE.match(f)),
+        None,
+    )
+    if desc_idx is None:
+        return None
+    date_idx = next((i for i in range(desc_idx - 1, -1, -1) if _DATE_FIELD_RE.match(fields[i])), None)
+    if date_idx is None:
+        return None
+
+    tail = fields[desc_idx + 1:]
+    if any(f and not _AMOUNT_FIELD_RE.match(f) for f in tail):
+        return None
+    names = ["debit", "credit", "resulting_balance"]
+    if len(tail) > len(names) and any(tail[len(names):]):
+        return None
+    tail = (tail + [""] * len(names))[: len(names)]
+    return {
+        "operation_date": fields[date_idx],
+        "description": fields[desc_idx],
+        **dict(zip(names, tail)),
+    }
+
+
+def _row_is_well_formed(fields, header):
+    if len(fields) != len(header):
+        return False
+    row = dict(zip(header, (f.strip() for f in fields)))
+    # Deliberately lenient about date/description content (unusual-but-valid
+    # rows must keep taking the normal path); only the shape and the numeric
+    # columns are checked, since that is what a shifted row breaks.
+    return all(
+        not row.get(k) or _AMOUNT_FIELD_RE.match(row[k])
+        for k in ("debit", "credit", "resulting_balance")
+    )
+
+
 def parse_llm_output(output_text: str, source_text: str):
     """Parse the model's raw text output into parsed_rows plus
     starting/ending balance, cross-checking debit/credit assignment and
@@ -302,7 +355,14 @@ def parse_llm_output(output_text: str, source_text: str):
     parsed_rows = []
     for line in data_lines:
         fields = line.split("|")
-        row = dict(zip(header, fields))
+        if _row_is_well_formed(fields, header):
+            row = dict(zip(header, fields))
+        else:
+            row = _realign_row_fields(fields, header)
+            if row is None:
+                print(f"ERROR: Could not make sense of model output line '{line}' (wrong shape, and no date/description to realign on).")
+                raise SystemExit(1)
+            print(f"Realigned malformed model output line '{line}' -> {row}")
 
         description = row.get("description", "").strip()
         description = re.sub(r"\s+\d{2}\.\d{2}$", "", description).strip()
